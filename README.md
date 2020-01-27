@@ -8,6 +8,8 @@ the works from the respective papers as well as the book by Maxim Lapan.
 * Double DQN
 * Dueling DQN
 
+![Rewards_of_Episodes](https://github.com/intelaashish/Comparing_Reinforcement_Learning_algorithms_on_Atari_Games/blob/master/Playing_Pong_with_Deep_Q_Network/DQN_Images/reward_of_episode.svg)
+
 
 
 
