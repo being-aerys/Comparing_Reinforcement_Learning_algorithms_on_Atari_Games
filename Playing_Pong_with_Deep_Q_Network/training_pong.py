@@ -1,15 +1,16 @@
 #This work was done as a self-practise with references from Deep Reinforcement Learning Hands-On by Maxim Lapan.
 
-import Wrappers_for_hacks_for_better_performance
 import DQN_model
 import collections, numpy as np
 import torch, argparse, time
 from tensorboardX import SummaryWriter
+import gym
+import Wrappers_for_hacks_for_better_performance
 
 '''CONSTANTS'''
-DISCOUNT_FACTOR = 0.9
+DISCOUNT_FACTOR = 0.99
 DEFAULT_ENVIRONMENT = "PongNoFrameskip-v4"
-DEFAULT_REWARD_TO_BEAT = 20
+DEFAULT_REWARD_TO_BEAT = 19.5
 REPLAY_BUFFER_SIZE = 10000
 INITIAL_EPSILON_FOR_EXPLORATION = 1
 FINAL_EPSILON = 0.02
@@ -37,40 +38,43 @@ class Experience_Replay_Buffer:
     def append(self, sample_experience):
         self.replay_buffer.append(sample_experience)
 
-    def sample_an_experience(self, batch_size_to_sample):
+    def sample_experiences(self, batch_size_to_sample):
         #generate random integers between 0 and buffersize-1
-        random_indices = np.random.choice(len(self.replay_buffer),batch_size_to_sample,replace=False) #setting replace == False makes sure you do not sample the same element twice in a batch
-        states, actions, next_states, rewards, dones = zip(*[self.replay_buffer[idx] for idx in random_indices])
-        #point is changing the data types below?
-        # print(np.array(states))
-        # print(np.array(actions))
-        # print(np.array(rewards, dtype=np.float32))
-        return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), np.array(next_states), np.array(dones, dtype=np.float)
+        random_indices = np.random.choice(len(self.replay_buffer),batch_size_to_sample,replace=False)
+        #setting replace == False makes sure you do not sample the same element twice in a batch
+        states, actions, rewards, dones, next_states = zip(*[self.replay_buffer[idx] for idx in random_indices])
+        #point is changing the data types below
+        return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), np.array(dones, dtype=np.float), np.array(next_states)
 
 '''DQN agent class definition'''
-class Agent:
+class DQN_Agent:
 
     def __init__(self, agent_env, replay_buffer):
         self.env = agent_env
         self.replay_buffer = replay_buffer
-        self.total_reward = 0
+        self._reset()
+
+    def _reset(self):
         self.state = self.env.reset()
+        self.total_reward = 0.0
 
+    def step(self, network, epsilon = 0.0, device = "cpu"):
 
-    def step(self, network, epsilon = 0, device = "cpu"):
-
-        episode_reward_holder = None
+        done_reward = None #'''HERE'''
 
         #Do Epsilon-Greedy exploration
         if np.random.random() < epsilon: #epsilon
             action_to_perform = self.env.action_space.sample()
         else: #greedy
-            state_array = np.array([self.state], copy= False) # Not making a new copy of the object but rather passing a reference
+            state_array = np.array([self.state], copy= False)
+            # Not making a new copy of the object but rather passing a reference
             state_tensor = torch.tensor(state_array).to(device)
             q_values_returned_by_the_network = network(state_tensor.float())
-            _, action_to_choose = torch.max(q_values_returned_by_the_network, dim= 1 ) # returns the maximum value of each row of the input tensor in the given dimension dim
+            _, action_to_choose = torch.max(q_values_returned_by_the_network, dim= 1 )
+            # returns the maximum value of each row of the input tensor in the given dimension dim
             action_to_perform = int(action_to_choose.item()) #getting only the data part of the cuda variable
 
+        #Take step in the env
         next_state, reward, is_done, _ = self.env.step(action_to_perform)
         self.total_reward += reward
 
@@ -80,13 +84,12 @@ class Agent:
 
         self.state = next_state
         if is_done == True:
-            episode_reward_holder = self.total_reward #we return the episode reward only if the episode is over, else we return None
-            self.env.reset()
-            self.total_reward = 0
+            done_reward = self.total_reward #we return the episode reward only if the episode is over, else we return None
+            self._reset()
 
-        return  episode_reward_holder
+        return  done_reward
 
-    def calculate_error(self, batch_of_samples, updating_network, target_network, device = "cpu"):
+    def calculate_temporal_difference_error(self, batch_of_samples, updating_network, target_network, device ="cpu"):
         states, actions, rewards, dones, next_states = batch_of_samples
 
         #convert all to tensors since we want to do faster matrix operations using a GPU
@@ -100,15 +103,15 @@ class Agent:
         #states_tensor is a batch of samples
         #we can do parallel processing
         q_values_returned = updating_network(states_tensor).gather(1,actions_tensor.unsqueeze(-1)).squeeze(-1)
-        next_states_q_values = target_network(next_states_tensor.float()).max(1)[0]
+        next_states_q_values = target_network(next_states_tensor).max(1)[0] #removed .float() before max
         next_states_q_values[dones_tensor] = 0.0
         next_states_q_values = next_states_q_values.detach() #see this detach() in the book
 
         biased_q_values = rewards_tensor + DISCOUNT_FACTOR * next_states_q_values
 
         loss_func = torch.nn.MSELoss()
-        loss = loss_func(q_values_returned, biased_q_values)
-        return loss
+        return loss_func(q_values_returned, biased_q_values) #HERE difference
+
 
 
 if __name__ == "__main__":
@@ -116,7 +119,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--cuda", default= False, action="store_true", help = "Enable GPU computations")
-    parser.add_argument("--environment", default= DEFAULT_ENVIRONMENT, help= "Name of the environment")
+    parser.add_argument("--environment", default= DEFAULT_ENVIRONMENT, help= "Name of the environment") #HERE different
     parser.add_argument("--reward_to_beat", default=DEFAULT_REWARD_TO_BEAT)
 
     args = parser.parse_args()
@@ -129,11 +132,14 @@ if __name__ == "__main__":
 
     '''Get the game environment and wrap it up with different wrappers'''
     env = Wrappers_for_hacks_for_better_performance.make_env(args.environment)
+    #To record the agent's performance
+    env = gym.wrappers.Monitor(env, "Recording", force = True) #force = True allows to record even if another directory named Recording already exists
 
     '''Create both UPDATING and TARGET networks'''
     updating_DQN_network = DQN_model.DQN_Model(env.observation_space.shape, env.action_space.n).float().to(device)
     target_DQN_network = DQN_model.DQN_Model(env.observation_space.shape, env.action_space.n).float().to(device)
-    print(target_DQN_network)
+
+
     print(updating_DQN_network)
 
     summary_writer = SummaryWriter(comment="-"+args.environment)
@@ -141,12 +147,12 @@ if __name__ == "__main__":
 
     exp_replay_buffer = Experience_Replay_Buffer(REPLAY_BUFFER_SIZE)
 
-    dqn_agent = Agent(env, exp_replay_buffer)
+    dqn_agent = DQN_Agent(env, exp_replay_buffer)
 
 
     epsilon = INITIAL_EPSILON_FOR_EXPLORATION
 
-    optimizer = torch.optim.SGD(updating_DQN_network.parameters(), lr = LEARNING_RATE)
+    optimizer = torch.optim.Adam(updating_DQN_network.parameters(), lr = LEARNING_RATE)
 
     total_rewards = []
     frame_count = 0
@@ -176,13 +182,15 @@ if __name__ == "__main__":
             #Take the mean total reward of the last 100 episodes, will be used to check for convergence
             mean_reward = np.mean(total_rewards[-100:])
 
-            print("Current Episode ends in frame no: %d ,%d games played., mean reward of last 100 episodes: %.3f, Epsilon used: %.2f, Processing speed: %.2f frames per sec" % (frame_count, len(total_rewards), mean_reward, epsilon, speed))
+            #print("Current Episode ends in frame no: %d ,%d games played., mean reward of last 100 episodes: %.3f, Epsilon used: %.2f, Processing speed: %.2f frames per sec" % (frame_count, len(total_rewards), mean_reward, epsilon, speed))
+            print("In %d frames: Completed %d games, Mean reward of last 100 games %.3f, Epsilon used in the last game %.2f, Training speed %.2f frames/second" % (
+                frame_count, len(total_rewards), mean_reward, epsilon,speed))
 
             #Add values to the SummaryWriter
             summary_writer.add_scalar("epsilon", epsilon, frame_count)
             summary_writer.add_scalar("speed", speed, frame_count)
-            summary_writer.add_scalar("reward_100", mean_reward, frame_count)
-            summary_writer.add_scalar("reward", reward, frame_count)
+            summary_writer.add_scalar("mean_reward_last_100_episodes", mean_reward, frame_count)
+            summary_writer.add_scalar("reward_of_episode", reward, frame_count)
 
             #Save model until the env is solved
             if current_best_mean_reward is None or current_best_mean_reward < mean_reward:
@@ -205,9 +213,9 @@ if __name__ == "__main__":
 
         #Update the updating network
         optimizer.zero_grad()
-        batch = exp_replay_buffer.sample_an_experience(BATCH_SIZE)
-        loss_t = dqn_agent.calculate_error(batch, updating_DQN_network, target_DQN_network, device=device)
-        loss_t.backward()
+        batch = exp_replay_buffer.sample_experiences(BATCH_SIZE)
+        loss = dqn_agent.calculate_temporal_difference_error(batch, updating_DQN_network, target_DQN_network, device=device)
+        loss.backward()
         optimizer.step()
 
     summary_writer.close()
